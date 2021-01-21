@@ -692,7 +692,8 @@ void TWPartition::Setup_Data_Partition(bool Display_Error) {
 	} else if (!Mount(false)) {
 		if (Is_Present) {
 			if (Key_Directory.empty()) {
-				set_partition_data(Actual_Block_Device.c_str(), Crypto_Key_Location.c_str(), Fstab_File_System.c_str());
+				set_partition_data(Actual_Block_Device.c_str(), Crypto_Key_Location.c_str(),
+				Fstab_File_System.c_str());
 				if (cryptfs_check_footer() == 0) {
 					Is_Encrypted = true;
 					Is_Decrypted = false;
@@ -700,6 +701,7 @@ void TWPartition::Setup_Data_Partition(bool Display_Error) {
 					Current_File_System = "emmc";
 					Setup_Image();
 					DataManager::SetValue(TW_CRYPTO_PWTYPE, cryptfs_get_password_type());
+					DataManager::SetValue("tw_crypto_pwtype_0", cryptfs_get_password_type());
 					DataManager::SetValue(TW_CRYPTO_PASSWORD, "");
 					DataManager::SetValue("tw_crypto_display", "");
 				} else {
@@ -710,11 +712,14 @@ void TWPartition::Setup_Data_Partition(bool Display_Error) {
 				Is_Decrypted = false;
 			}
 		} else if (Key_Directory.empty()) {
-			LOGERR("Primary block device '%s' for mount point '%s' is not present!\n", Primary_Block_Device.c_str(), Mount_Point.c_str());
+			LOGERR("Primary block device '%s' for mount point '%s' is not present!\n",
+			Primary_Block_Device.c_str(), Mount_Point.c_str());
 		}
 	} else {
 		Set_FBE_Status();
-		if (!Decrypt_FBE_DE()) {
+		int is_device_fbe;
+		DataManager::GetValue(TW_IS_FBE, is_device_fbe);
+		if (!Decrypt_FBE_DE() && is_device_fbe == 1) {
 			char wrappedvalue[PROPERTY_VALUE_MAX];
 			property_get("fbe.data.wrappedkey", wrappedvalue, "");
 			std::string wrappedkeyvalue(wrappedvalue);
@@ -746,11 +751,11 @@ void TWPartition::Set_FBE_Status() {
 	DataManager::SetValue(TW_IS_DECRYPTED, 1);
 	Is_Encrypted = true;
 	Is_Decrypted = true;
-	LOGINFO("Setup_Data_Partition::Key_Directory::%s\n", Key_Directory.c_str());
 	if (Key_Directory.empty()) {
 		Is_FBE = false;
 		DataManager::SetValue(TW_IS_FBE, 0);
 	} else {
+		LOGINFO("Setup_Data_Partition::Key_Directory::%s\n", Key_Directory.c_str());
 		Is_FBE = true;
 		DataManager::SetValue(TW_IS_FBE, 1);
 	}
@@ -760,32 +765,27 @@ bool TWPartition::Decrypt_FBE_DE() {
 	if (TWFunc::Path_Exists("/data/unencrypted/key/version")) {
 		DataManager::SetValue(TW_IS_FBE, 1);
 		DataManager::SetValue(TW_CRYPTO_PWTYPE, "0"); // Set initial value so that recovery will not be confused when using unencrypted data or failed to decrypt data
+		property_set("ro.crypto.state", "encrypted");
+		property_set("ro.crypto.type", "file");
 		LOGINFO("File Based Encryption is present\n");
 #ifdef TW_INCLUDE_FBE
 		Is_FBE = true;
-		DataManager::SetValue(TW_IS_FBE, 1);
 		ExcludeAll(Mount_Point + "/convert_fbe");
 		ExcludeAll(Mount_Point + "/unencrypted");
-		//ExcludeAll(Mount_Point + "/system/users/0"); // we WILL need to retain some of this if multiple users are present or we just need to delete more folders for the extra users somewhere else
 		ExcludeAll(Mount_Point + "/misc/vold/user_keys");
 		ExcludeAll(Mount_Point + "/misc/vold/volume_keys");
-		//ExcludeAll(Mount_Point + "/system_ce");
-		//ExcludeAll(Mount_Point + "/system_de");
-		//ExcludeAll(Mount_Point + "/misc_ce");
-		//ExcludeAll(Mount_Point + "/misc_de");
 		ExcludeAll(Mount_Point + "/system/gatekeeper.password.key");
 		ExcludeAll(Mount_Point + "/system/gatekeeper.pattern.key");
 		ExcludeAll(Mount_Point + "/system/locksettings.db");
-		//ExcludeAll(Mount_Point + "/system/locksettings.db-shm"); // don't seem to need this one, but the other 2 are needed
 		ExcludeAll(Mount_Point + "/system/locksettings.db-wal");
-		//ExcludeAll(Mount_Point + "/user_de");
-		//ExcludeAll(Mount_Point + "/misc/profiles/cur/0"); // might be important later
 		ExcludeAll(Mount_Point + "/misc/gatekeeper");
 		ExcludeAll(Mount_Point + "/misc/keystore");
 		ExcludeAll(Mount_Point + "/drm/kek.dat");
-		ExcludeAll(Mount_Point + "/system_de/0/spblob"); // contains data needed to decrypt pixel 2
-		ExcludeAll(Mount_Point + "/per_boot"); // removed each boot by init 
-
+		ExcludeAll(Mount_Point + "/system_de/0/spblob");  // contains data needed to decrypt pixel 2
+		ExcludeAll(Mount_Point + "/system/users/0/gatekeeper.password.key");
+		ExcludeAll(Mount_Point + "/system/users/0/gatekeeper.pattern.key");
+		ExcludeAll(Mount_Point + "/cache");
+		ExcludeAll(Mount_Point + "/per_boot"); // removed each boot by init
 		int retry_count = 3;
 		while (!Decrypt_DE() && --retry_count)
 			usleep(2000);
@@ -793,15 +793,27 @@ bool TWPartition::Decrypt_FBE_DE() {
 			property_set("ro.crypto.state", "encrypted");
 			Is_Encrypted = true;
 			Is_Decrypted = false;
-			Is_FBE = true;
-			DataManager::SetValue(TW_IS_FBE, 1);
+			DataManager::SetValue(TW_IS_ENCRYPTED, 1);
 			string filename;
 			int pwd_type = Get_Password_Type(0, filename);
 			if (pwd_type < 0) {
 				LOGERR("This TWRP does not have synthetic password decrypt support\n");
-				pwd_type = 0; // default password
+				pwd_type = 0;  // default password
+			}
+			PartitionManager.Parse_Users();  // after load_all_de_keys() to parse_users
+			std::vector<users_struct>::iterator iter;
+			std::vector<users_struct>* userList = PartitionManager.Get_Users_List();
+			for (iter = userList->begin(); iter != userList->end(); iter++) {
+				if (atoi((*iter).userId.c_str()) != 0) {
+					ExcludeAll(Mount_Point + "/system_de/" + (*iter).userId + "/spblob");
+					ExcludeAll(Mount_Point + "/system/users/" + (*iter).userId + "/gatekeeper.password.key");
+					ExcludeAll(Mount_Point + "/system/users/" + (*iter).userId + "/gatekeeper.pattern.key");
+					ExcludeAll(Mount_Point + "/system/users/" + (*iter).userId + "/locksettings.db");
+					ExcludeAll(Mount_Point + "/system/users/" + (*iter).userId + "/locksettings.db-wal");
+				}
 			}
 			DataManager::SetValue(TW_CRYPTO_PWTYPE, pwd_type);
+			DataManager::SetValue("tw_crypto_pwtype_0", pwd_type);
 			DataManager::SetValue(TW_CRYPTO_PASSWORD, "");
 			DataManager::SetValue("tw_crypto_display", "");
 			return true;
@@ -945,10 +957,15 @@ void TWPartition::Apply_TW_Flag(const unsigned flag, const char* str, const bool
 			}
 			break;
 		case TWFLAG_WRAPPEDKEY:
-			// Set fbe.data.wrappedkey to true
+			// Set wrappedkey props to true for data and/or metadata
 			{
-				property_set("fbe.data.wrappedkey", "true");
-				LOGINFO("FBE wrapped key enabled\n");
+				size_t slash_loc = Mount_Point.find('/');
+				std::string partition = Mount_Point.substr(slash_loc + 1);
+				if (Mount_Point == "/data" || Mount_Point == "/metadata") {
+					std::string wrapped_prop = "fbe." + partition + ".wrappedkey";
+					property_set(wrapped_prop.c_str(), "true");
+					LOGINFO("FBE wrapped key enabled for %s\n", Mount_Point.c_str());
+				}
 			}
 			break;
 		case TWFLAG_FLASHIMG:
@@ -1512,7 +1529,7 @@ bool TWPartition::Mount(bool Display_Error) {
 		}
 	}
 
-	if (Current_File_System == "ntfs" && (TWFunc::Path_Exists("/sbin/ntfs-3g") || TWFunc::Path_Exists("/sbin/mount.ntfs"))) {
+	if (Current_File_System == "ntfs" && !TWFunc::Path_Exists("/sys/module/tntfs") && (TWFunc::Path_Exists("/sbin/ntfs-3g") || TWFunc::Path_Exists("/sbin/mount.ntfs"))) {
 		string cmd;
 		string Ntfsmount_Binary = "";
 
@@ -1532,6 +1549,9 @@ bool TWPartition::Mount(bool Display_Error) {
 		} else {
 			LOGINFO("ntfs-3g failed to mount, trying regular mount method.\n");
 		}
+	} else {
+		if (Current_File_System == "ntfs" && TWFunc::Path_Exists("/sys/module/tntfs"))
+			Current_File_System = "tntfs";
 	}
 
 	if (Mount_Read_Only)
@@ -1714,16 +1734,16 @@ bool TWPartition::Wipe(string New_File_System) {
 			wiped = Wipe_EXT4();
 		else if (New_File_System == "ext2" || New_File_System == "ext3")
 			wiped = Wipe_EXTFS(New_File_System);
-		else if (New_File_System == "vfat")
-			wiped = Wipe_FAT();
 		else if (New_File_System == "exfat")
 			wiped = Wipe_EXFAT();
+		else if (New_File_System == "ntfs" || Current_File_System == "tntfs")
+			wiped = Wipe_NTFS();
 		else if (New_File_System == "yaffs2")
 			wiped = Wipe_MTD();
 		else if (New_File_System == "f2fs")
 			wiped = Wipe_F2FS();
-		else if (New_File_System == "ntfs")
-			wiped = Wipe_NTFS();
+		else if (New_File_System == "vfat")
+			wiped = Wipe_FAT();
 		else {
 			LOGERR("Unable to wipe '%s' -- unknown file system '%s'\n", Mount_Point.c_str(), New_File_System.c_str());
 			return false;
@@ -1787,7 +1807,7 @@ bool TWPartition::Can_Repair() {
 		return true;
 	else if (Current_File_System == "f2fs" && TWFunc::Path_Exists("/sbin/fsck.f2fs"))
 		return true;
-	else if (Current_File_System == "ntfs" && (TWFunc::Path_Exists("/sbin/ntfsfix") || TWFunc::Path_Exists("/sbin/fsck.ntfs")))
+	else if ((Current_File_System == "ntfs" || Current_File_System == "tntfs") && (TWFunc::Path_Exists("/sbin/ntfsfix") || TWFunc::Path_Exists("/sbin/fsck.ntfs")))
 		return true;
 	return false;
 }
@@ -1871,7 +1891,7 @@ bool TWPartition::Repair() {
 			return false;
 		}
 	}
-	if (Current_File_System == "ntfs") {
+	if (Current_File_System == "ntfs" || Current_File_System == "tntfs") {
 		string Ntfsfix_Binary;
 		if (TWFunc::Path_Exists("/sbin/ntfsfix"))
 			Ntfsfix_Binary = "ntfsfix";
@@ -2594,6 +2614,22 @@ bool TWPartition::Backup_Tar(PartitionSettings *part_settings, pid_t *tar_fork_p
 	Full_FileName = part_settings->Backup_Folder + "/" + Backup_FileName;
 	if (Has_Data_Media)
 		gui_msg(Msg(msg::kWarning, "backup_storage_warning=Backups of {1} do not include any files in internal storage such as pictures or downloads.")(Display_Name));
+	if (Mount_Point == "/data" && DataManager::GetIntValue(TW_IS_FBE)) {
+		std::vector<users_struct>::iterator iter;
+		std::vector<users_struct>* userList = PartitionManager.Get_Users_List();
+		for (iter = userList->begin(); iter != userList->end(); iter++) {
+			if (!(*iter).isDecrypted && (*iter).userId != "0") {
+				gui_msg(Msg(msg::kWarning,
+				"backup_storage_undecrypt_warning=Backup will not include some files from user {1} "
+				"because the user is not decrypted.")((*iter).userId));
+				backup_exclusions.add_absolute_dir("/data/system_ce/" + (*iter).userId);
+				backup_exclusions.add_absolute_dir("/data/misc_ce/" + (*iter).userId);
+				backup_exclusions.add_absolute_dir("/data/vendor_ce/" + (*iter).userId);
+				backup_exclusions.add_absolute_dir("/data/media/" + (*iter).userId);
+				backup_exclusions.add_absolute_dir("/data/user/" + (*iter).userId);
+			}
+		}
+	}
 	tar.part_settings = part_settings;
 	tar.backup_exclusions = &backup_exclusions;
 	tar.setdir(Backup_Path);
@@ -3123,7 +3159,7 @@ uint64_t TWPartition::Get_Max_FileSize() {
 		maxFileSize = 16 * constTB; //16 TB
 	else if (Current_File_System == "vfat")
 		maxFileSize = 4 * constGB; //4 GB
-	else if (Current_File_System == "ntfs")
+	else if (Current_File_System == "ntfs" || Current_File_System == "tntfs")
 		maxFileSize = 256 * constTB; //256 TB
 	else if (Current_File_System == "exfat")
 		maxFileSize = 16 * constPB; //16 PB
@@ -3448,4 +3484,16 @@ void TWPartition::Set_Can_Be_Wiped(bool val) {
 
 void TWPartition::Change_Mount_Point(string new_mp) {
 	Storage_Path = Backup_Path = Mount_Point = new_mp;
+}
+
+std::string TWPartition::Get_Backup_FileName() {
+	return Backup_FileName;
+}
+
+std::string TWPartition::Get_Display_Name() {
+	return Display_Name;
+}
+
+bool TWPartition::Is_SlotSelect() {
+	return SlotSelect;
 }

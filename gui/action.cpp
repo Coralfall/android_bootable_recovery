@@ -35,18 +35,20 @@
 #include <sys/wait.h>
 #include <dirent.h>
 #include <private/android_filesystem_config.h>
+#include <android-base/properties.h>
 
 #include <string>
 #include <sstream>
 #include "../partitions.hpp"
 #include "../twrp-functions.hpp"
+#include "../twrpRepacker.hpp"
 #include "../openrecoveryscript.hpp"
 
-#include "install/adb_install.h"
+#include "twinstall/adb_install.h"
 
 #include "fuse_sideload.h"
 #include "blanktimer.hpp"
-#include "../twinstall.h"
+#include "twinstall.h"
 
 extern "C" {
 #include "../twcommon.h"
@@ -68,6 +70,7 @@ static string zip_queue[10];
 static int zip_queue_index;
 pid_t sideload_child_pid;
 extern GUITerminal* term;
+extern std::vector<users_struct> Users_List;
 
 static void *ActionThread_work_wrapper(void *data);
 
@@ -206,6 +209,8 @@ GUIAction::GUIAction(xml_node<>* node)
 		ADD_ACTION(setlanguage);
 		ADD_ACTION(checkforapp);
 		ADD_ACTION(togglebacklight);
+		ADD_ACTION(enableadb);
+		ADD_ACTION(enablefastboot);
 
 		// remember actions that run in the caller thread
 		for (mapFunc::const_iterator it = mf.begin(); it != mf.end(); ++it)
@@ -418,6 +423,7 @@ int GUIAction::flash_zip(std::string filename, int* wipe_cache)
 		simulate_progress_bar();
 	} else {
 		ret_val = TWinstall_zip(filename.c_str(), wipe_cache);
+		PartitionManager.Unlock_Block_Partitions();
 
 		// Now, check if we need to ensure TWRP remains installed...
 		struct stat st;
@@ -1022,7 +1028,7 @@ int GUIAction::getpartitiondetails(std::string arg)
 					DataManager::SetValue("tw_partition_exfat", 1);
 				else
 					DataManager::SetValue("tw_partition_exfat", 0);
-				if (TWFunc::Path_Exists("/sbin/mkfs.f2fs"))
+				if (TWFunc::Path_Exists("/sbin/mkfs.f2fs") || TWFunc::Path_Exists("/sbin/make_f2fs"))
 					DataManager::SetValue("tw_partition_f2fs", 1);
 				else
 					DataManager::SetValue("tw_partition_f2fs", 0);
@@ -1147,6 +1153,7 @@ int GUIAction::reinject_after_flash()
 {
     char getvalue[PROPERTY_VALUE_MAX];
     property_get("ro.boot.fastboot", getvalue, "");
+    twrpRepacker repacker;
     std::string bootmode(getvalue);
 	if (((DataManager::GetIntValue(TW_HAS_INJECTTWRP) == 1 && DataManager::GetIntValue(TW_INJECT_AFTER_ZIP) == 1) || DataManager::GetIntValue("pb_theming_mode") == 1)
 		 && bootmode != "1") {
@@ -1165,7 +1172,7 @@ int GUIAction::reinject_after_flash()
 			Repack_Options.Disable_Force_Encrypt = false;
 			Repack_Options.Backup_First = false;
 			Repack_Options.Type = REPLACE_RAMDISK;
-			if (!PartitionManager.Repack_Images(path, Repack_Options))
+			if (!repacker.Repack_Image_And_Flash(path, Repack_Options))
 				return 0;
             string cmd = "rm -f " + path;
 		    TWFunc::Exec_Cmd(cmd);
@@ -1773,12 +1780,31 @@ int GUIAction::decrypt(std::string arg __unused)
 		simulate_progress_bar();
 	} else {
 		string Password;
+		string userID;
 		DataManager::GetValue("tw_crypto_password", Password);
-		op_status = PartitionManager.Decrypt_Device(Password);
+
+		if (DataManager::GetIntValue(TW_IS_FBE)) {  // for FBE
+			DataManager::GetValue("tw_crypto_user_id", userID);
+			if (userID != "") {
+				op_status = PartitionManager.Decrypt_Device(Password, atoi(userID.c_str()));
+				if (userID != "0") {
+					if (op_status != 0)
+						op_status = 1;
+					operation_end(op_status);
+	          		return 0;
+				}
+			} else {
+				LOGINFO("User ID not found\n");
+				op_status = 1;
+			}
+		::sleep(1);
+		} else {  // for FDE
+			op_status = PartitionManager.Decrypt_Device(Password);
+		}
+
 		if (op_status != 0)
 			op_status = 1;
 		else {
-
 			DataManager::SetValue(TW_IS_ENCRYPTED, 0);
 
 			int has_datamedia;
@@ -1811,9 +1837,9 @@ int GUIAction::adbsideload(std::string arg __unused)
 		bool mtp_was_enabled = TWFunc::Toggle_MTP(false);
 
 		// wait for the adb connection
-		// int ret = apply_from_adb("/", &sideload_child_pid);
 		Device::BuiltinAction reboot_action = Device::REBOOT_BOOTLOADER;
-		int ret = ApplyFromAdb("/", &reboot_action);
+		int ret = twrp_sideload("/", &reboot_action);
+		sideload_child_pid = GetMiniAdbdPid();
 		DataManager::SetValue("tw_has_cancel", 0); // Remove cancel button from gui now that the zip install is going to start
 
 		if (ret != 0) {
@@ -1824,27 +1850,11 @@ int GUIAction::adbsideload(std::string arg __unused)
 			int wipe_cache = 0;
 			int wipe_dalvik = 0;
 			DataManager::GetValue("tw_wipe_dalvik", wipe_dalvik);
-
-			if (TWinstall_zip(FUSE_SIDELOAD_HOST_PATHNAME, &wipe_cache) == 0) {
-				if (wipe_cache || DataManager::GetIntValue("tw_wipe_cache"))
-					PartitionManager.Wipe_By_Path("/cache");
-				if (wipe_dalvik)
-					PartitionManager.Wipe_Dalvik_Cache();
-			} else {
-				ret = 1; // failure
-			}
+			if (wipe_cache || DataManager::GetIntValue("tw_wipe_cache"))
+				PartitionManager.Wipe_By_Path("/cache");
+			if (wipe_dalvik)
+				PartitionManager.Wipe_Dalvik_Cache();
 		}
-		if (sideload_child_pid) {
-			LOGINFO("Signaling child sideload process to exit.\n");
-			struct stat st;
-			// Calling stat() on this magic filename signals the minadbd
-			// subprocess to shut down.
-			stat(FUSE_SIDELOAD_HOST_EXIT_PATHNAME, &st);
-			int status;
-			LOGINFO("Waiting for child sideload process to exit.\n");
-			waitpid(sideload_child_pid, &status, 0);
-		}
-		property_set("ctl.start", "adbd");
 		TWFunc::Toggle_MTP(mtp_was_enabled);
 		operation_end(ret);
 	}
@@ -1860,6 +1870,7 @@ int GUIAction::adbsideloadcancel(std::string arg __unused)
 	// Calling stat() on this magic filename signals the minadbd
 	// subprocess to shut down.
 	stat(FUSE_SIDELOAD_HOST_EXIT_PATHNAME, &st);
+	sideload_child_pid = GetMiniAdbdPid();
 	if (!sideload_child_pid) {
 		LOGERR("Unable to get child ID\n");
 		return 0;
@@ -2189,10 +2200,19 @@ int GUIAction::togglebacklight(std::string arg __unused)
 int GUIAction::setbootslot(std::string arg)
 {
 	operation_start("Set Boot Slot");
-	if (!simulate)
-		PartitionManager.Set_Active_Slot(arg);
-	else
+	if (!simulate) {
+		if (!PartitionManager.UnMount_By_Path("/vendor", false)) {
+			// PartitionManager failed to unmount /vendor, this should not happen,
+			// but in case it does, do a lazy unmount
+			LOGINFO("WARNING: vendor partition could not be unmounted normally!\n");
+			umount2("/vendor", MNT_DETACH);
+			PartitionManager.Set_Active_Slot(arg);
+		} else {
+			PartitionManager.Set_Active_Slot(arg);
+		}
+	} else {
 		simulate_progress_bar();
+	}
 	operation_end(0);
 	return 0;
 }
@@ -2478,6 +2498,8 @@ int GUIAction::flashlight(std::string arg __unused)
 int GUIAction::repackimage(std::string arg __unused)
 {
 	int op_status = 1;
+	twrpRepacker repacker;
+
 	operation_start("Repack Image");
 	if (!simulate)
 	{
@@ -2490,7 +2512,7 @@ int GUIAction::repackimage(std::string arg __unused)
 			Repack_Options.Type = REPLACE_KERNEL;
 		else
 			Repack_Options.Type = REPLACE_RAMDISK;
-		if (!PartitionManager.Repack_Images(path, Repack_Options))
+		if (!repacker.Repack_Image_And_Flash(path, Repack_Options))
 			goto exit;
 	} else
 		simulate_progress_bar();
@@ -2503,6 +2525,8 @@ exit:
 int GUIAction::fixabrecoverybootloop(std::string arg __unused)
 {
 	int op_status = 1;
+	twrpRepacker repacker;
+
 	operation_start("Repack Image");
 	if (!simulate)
 	{
@@ -2518,7 +2542,7 @@ int GUIAction::fixabrecoverybootloop(std::string arg __unused)
 			gui_msg(Msg(msg::kError, "unable_to_locate=Unable to locate {1}.")("/boot"));
 			goto exit;
 		}
-		if (!PartitionManager.Prepare_Repack(part, REPACK_ORIG_DIR, DataManager::GetIntValue("tw_repack_backup_first") != 0, gui_lookup("repack", "Repack")))
+		if (!repacker.Backup_Image_For_Repack(part, REPACK_ORIG_DIR, DataManager::GetIntValue("tw_repack_backup_first") != 0, gui_lookup("repack", "Repack")))
 			goto exit;
 		DataManager::SetProgress(.25);
 		gui_msg("fixing_recovery_loop_patch=Patching kernel...");
@@ -2604,5 +2628,16 @@ int GUIAction::change_terminal(std::string arg) {
 	}
 	else
 		LOGINFO("error\n");
+	return 0;
+}
+int GUIAction::enableadb(std::string arg __unused) {
+	android::base::SetProperty("sys.usb.config", "none");
+	android::base::SetProperty("sys.usb.config", "adb");
+	return 0;
+}
+
+int GUIAction::enablefastboot(std::string arg __unused) {
+	android::base::SetProperty("sys.usb.config", "none");
+	android::base::SetProperty("sys.usb.config", "fastboot");
 	return 0;
 }

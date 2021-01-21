@@ -42,9 +42,10 @@ typedef enum
 	rb_system,
 	rb_recovery,
 	rb_poweroff,
-	rb_bootloader,     // May also be fastboot
+	rb_bootloader,
 	rb_download,
 	rb_edl,
+	rb_fastboot
 } RebootCommand;
 
 enum Archive_Type {
@@ -63,7 +64,7 @@ public:
 	static string Get_Filename(const string& Path);                             // Trims the path off of a filename
 	static string Get_output(const string& cmd);
 
-	static int Exec_Cmd(const string& cmd, string &result);                     //execute a command and return the result as a string by reference
+	static int Exec_Cmd(const string& cmd, string &result, bool combine_stderr = false);                     //execute a command and return the result as a string by reference, set combined_stderror to add stderr
 	static int Exec_Cmd(const string& cmd, bool Show_Errors = true, bool retn = false); //execute a command, displays an error to the GUI if Show_Errors is true, Show_Errors is true by default, also return exit code when required
 	static int Wait_For_Child(pid_t pid, int *status, string Child_Name, bool Show_Errors = true, bool retn = false); // Waits for pid to exit and checks exit status, displays an error to the GUI if Show_Errors is true which is the default, also return exitcode if required
 	static int Wait_For_Child_Timeout(pid_t pid, int *status, const string& Child_Name, int timeout); // Waits for a pid to exit until the timeout is hit. If timeout is hit, kill the chilld.
@@ -138,6 +139,7 @@ public:
 	static std::string getprop(std::string arg); //set the arg value to PB_PROP_VALUE
 	static bool Set_Encryption_Policy(std::string path, const fscrypt_encryption_policy &policy); // set encryption policy for path
 	static void List_Mounts();
+	static void Clear_Bootloader_Message();
 
 private:
 	static void Copy_Log(string Source, string Destination);

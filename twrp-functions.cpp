@@ -1,5 +1,5 @@
 /*
-	Copyright 2012 bigbiff/Dees_Troy TeamWin
+	Copyright 2012-2020 TeamWin
 	This file is part of TWRP/TeamWin Recovery Project.
 
 	TWRP is free software: you can redistribute it and/or modify
@@ -45,7 +45,7 @@
 #include "data.hpp"
 #include "partitions.hpp"
 #include "variables.h"
-#include "bootloader_message_twrp/include/bootloader_message_twrp/bootloader_message.h"
+#include "bootloader_message/include/bootloader_message/bootloader_message.h"
 #include "cutils/properties.h"
 #include "cutils/android_reboot.h"
 #include <sys/reboot.h>
@@ -74,18 +74,21 @@ static string dtb = "", ram = "";
 struct selabel_handle *selinux_handle;
 
 /* Execute a command */
-int TWFunc::Exec_Cmd(const string& cmd, string &result) {
+int TWFunc::Exec_Cmd(const string& cmd, string &result, bool combine_stderr) {
 	FILE* exec;
-	char buffer[512];
+	char buffer[130];
 	int ret = 0;
-	exec = popen(cmd.c_str(), "r");
-	if (!exec) return -1;
+	std::string popen_cmd = cmd;
+	if (combine_stderr)
+		popen_cmd = cmd + " 2>&1";
+	exec = __popen(popen_cmd.c_str(), "r");
+
 	while (!feof(exec)) {
-		if (fgets(buffer, 512, exec) != NULL) {
+		if (fgets(buffer, 128, exec) != NULL) {
 			result += buffer;
 		}
 	}
-	ret = pclose(exec);
+	ret = __pclose(exec);
 	return ret;
 }
 
@@ -648,19 +651,6 @@ void TWFunc::Update_Log_File(void) {
 	chmod(logCopy.c_str(), 0600);
 	chmod(lastLogCopy.c_str(), 0640);
 
-	// Reset bootloader message
-	TWPartition* Part = PartitionManager.Find_Partition_By_Path("/misc");
-	if (Part != NULL) {
-		std::string err;
-		if (!clear_bootloader_message((void*)&err)) {
-			if (err == "no misc device set") {
-				LOGINFO("%s\n", err.c_str());
-			} else {
-				LOGERR("%s\n", err.c_str());
-			}
-		}
-	}
-
 	if (get_log_dir() == CACHE_LOGS_DIR) {
 		if (PartitionManager.Mount_By_Path("/cache", false)) {
 			if (unlink("/cache/recovery/command") && errno != ENOENT) {
@@ -669,6 +659,13 @@ void TWFunc::Update_Log_File(void) {
 		}
 	}
 	sync();
+}
+
+void TWFunc::Clear_Bootloader_Message() {
+	std::string err;
+	if (!clear_bootloader_message(&err)) {
+		LOGINFO("%s\n", err.c_str());
+	}
 }
 
 void TWFunc::Update_Intent_File(string Intent) {
@@ -701,18 +698,10 @@ int TWFunc::tw_reboot(RebootCommand command)
 #endif
 		case rb_recovery:
 			check_and_run_script("/sbin/rebootrecovery.sh", "reboot recovery");
-#ifdef ANDROID_RB_PROPERTY
 			return property_set(ANDROID_RB_PROPERTY, "reboot,recovery");
-#else
-			return __reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, (void*) "recovery");
-#endif
 		case rb_bootloader:
 			check_and_run_script("/sbin/rebootbootloader.sh", "reboot bootloader");
-#ifdef ANDROID_RB_PROPERTY
 			return property_set(ANDROID_RB_PROPERTY, "reboot,bootloader");
-#else
-			return __reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, (void*) "bootloader");
-#endif
 		case rb_poweroff:
 			check_and_run_script("/sbin/poweroff.sh", "power off");
 #ifdef ANDROID_RB_PROPERTY
@@ -724,18 +713,12 @@ int TWFunc::tw_reboot(RebootCommand command)
 #endif
 		case rb_download:
 			check_and_run_script("/sbin/rebootdownload.sh", "reboot download");
-#ifdef ANDROID_RB_PROPERTY
 			return property_set(ANDROID_RB_PROPERTY, "reboot,download");
-#else
-			return __reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, (void*) "download");
-#endif
 		case rb_edl:
 			check_and_run_script("/sbin/rebootedl.sh", "reboot edl");
-#ifdef ANDROID_RB_PROPERTY
 			return property_set(ANDROID_RB_PROPERTY, "reboot,edl");
-#else
-			return __reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, (void*) "edl");
-#endif
+		case rb_fastboot:
+			return property_set(ANDROID_RB_PROPERTY, "reboot,fastboot");
 		default:
 			return -1;
 	}

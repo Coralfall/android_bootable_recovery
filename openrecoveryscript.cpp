@@ -51,7 +51,7 @@
 #include "gui/pages.hpp"
 #include "orscmd/orscmd.h"
 #include "twinstall.h"
-#include "install/adb_install.h"
+#include "twinstall/adb_install.h"
 extern "C" {
 	#include "gui/gui.h"
 	#include "cutils/properties.h"
@@ -373,11 +373,9 @@ int OpenRecoveryScript::run_script_file(void) {
 
 				int wipe_cache = 0;
 				string result;
-				// pid_t sideload_child_pid;
 
 				gui_msg("start_sideload=Starting ADB sideload feature...");
 
-				// ret_val = apply_from_adb("/", &sideload_child_pid);
 				Device::BuiltinAction reboot_action = Device::REBOOT_BOOTLOADER;
 				ret_val = ApplyFromAdb("/", &reboot_action);
 				if (ret_val != 0) {
@@ -390,8 +388,9 @@ int OpenRecoveryScript::run_script_file(void) {
 				} else {
 					ret_val = 1; // failure
 				}
+				PartitionManager.Unlock_Block_Partitions();
 				sideload = 1; // Causes device to go to the home screen afterwards
-#ifdef USE_28_INSTALL 
+				pid_t sideload_child_pid = GetMiniAdbdPid();
 				if (sideload_child_pid != 0) {
 					LOGINFO("Signaling child sideload process to exit.\n");
 					struct stat st;
@@ -402,7 +401,6 @@ int OpenRecoveryScript::run_script_file(void) {
 					LOGINFO("Waiting for child sideload process to exit.\n");
 					waitpid(sideload_child_pid, &status, 0);
 				}
-#endif
 				property_set("ctl.start", "adbd");
 				gui_msg("done=Done.");
 			} else if (strcmp(command, "fixperms") == 0 || strcmp(command, "fixpermissions") == 0 || strcmp(command, "fixcontexts") == 0) {
@@ -410,13 +408,22 @@ int OpenRecoveryScript::run_script_file(void) {
 				if (ret_val != 0)
 					ret_val = 1; // failure
 			} else if (strcmp(command, "decrypt") == 0) {
+				// twrp cmd cannot decrypt a password with space, should decrypt on gui
 				if (*value) {
-					ret_val = PartitionManager.Decrypt_Device(value);
+					string tmp = value;
+					std::vector<string> args = TWFunc::Split_String(tmp, " ");
+
+					string pass = args[0];
+					string userid = "0";
+					if (args.size() > 1)
+						userid = args[1];
+
+					ret_val = PartitionManager.Decrypt_Device(pass, atoi(userid.c_str()));
 					if (ret_val != 0)
-						ret_val = 1; // failure
+						ret_val = 1;  // failure
 				} else {
 					gui_err("no_pwd=No password provided.");
-					ret_val = 1; // failure
+					ret_val = 1;  // failure
 				}
 			} else if (strcmp(command, "listmounts") == 0) {
 				TWFunc::List_Mounts();
@@ -432,19 +439,18 @@ int OpenRecoveryScript::run_script_file(void) {
 			ret_val = 24;
 		}
 	} else {
-		gui_msg(Msg(msg::kError, "error_opening_strerr=Error opening: '{1}' ({2})")(SCRIPT_FILE_TMP)(strerror(errno)));
+		gui_msg(Msg(msg::kError, "error_opening_strerr=Error opening: '{1}' ({2})")(SCRIPT_FILE_TMP)(
+			strerror(errno)));
 		return 1;
 	}
 	if (sideload)
-		ret_val = 1; // Forces booting to the home page after sideload
+		ret_val = 1;  // Forces booting to the home page after sideload
 	return ret_val;
 }
 
 int OpenRecoveryScript::Insert_ORS_Command(string Command) {
 	ofstream ORSfile(SCRIPT_FILE_TMP, ios_base::app | ios_base::out);
 	if (ORSfile.is_open()) {
-		//if (Command.substr(Command.size() - 1, 1) != "\n")
-		//	Command += "\n";
 		LOGINFO("Inserting '%s'\n", Command.c_str());
 		ORSfile << Command.c_str() << endl;
 		ORSfile.close();
@@ -660,26 +666,48 @@ int OpenRecoveryScript::Run_OpenRecoveryScript_Action() {
 
 // this is called by the "twcmd" GUI action when a command is received via FIFO from the "twrp" command line tool
 void OpenRecoveryScript::Run_CLI_Command(const char* command) {
-	if (strlen(command) > 11 && strncmp(command, "runscript", 9) == 0) {
-		const char* filename = command + 10;
-		if (OpenRecoveryScript::copy_script_file(filename) == 0) {
-			LOGINFO("Unable to copy script file\n");
+	string tmp = command;
+	std::vector<string> parts =
+		TWFunc::Split_String(tmp, " ");  // pats[0] is cmd, parts[1...] is args
+	string cmd_str = parts[0];
+
+	if (cmd_str == "runscript") {
+		if (parts.size() > 1) {
+			string filename = parts[1];
+			if (OpenRecoveryScript::copy_script_file(filename) == 0) {
+				LOGINFO("Unable to copy script file\n");
+			} else {
+				OpenRecoveryScript::run_script_file();
+			}
 		} else {
-			OpenRecoveryScript::run_script_file();
+			LOGINFO("Missing parameter: script file name\n");
 		}
-	} else if (strlen(command) > 5 && strncmp(command, "get", 3) == 0) {
-		const char* varname = command + 4;
-		string value;
-		DataManager::GetValue(varname, value);
-		gui_print("%s = %s\n", varname, value.c_str());
-	} else if (strlen(command) > 9 && strncmp(command, "decrypt", 7) == 0) {
-		const char* pass = command + 8;
-		gui_msg("decrypt_cmd=Attempting to decrypt data partition via command line.");
-		if (PartitionManager.Decrypt_Device(pass) == 0) {
-			// set_page_done = 1;  // done by singleaction_page anyway
-			std::string orsFile = TWFunc::get_log_dir() + "/openrecoveryscript";
-			if (TWFunc::Path_Exists(orsFile)) {
-				Run_OpenRecoveryScript_Action();
+	} else if (cmd_str == "get") {
+		if (parts.size() > 1) {
+			string varname = parts[1];
+			string value;
+			DataManager::GetValue(varname, value);
+			gui_print("%s = %s\n", varname.c_str(), value.c_str());
+		} else {
+			LOGINFO("Missing parameter: var name\n");
+		}
+	} else if (cmd_str == "decrypt") {
+		// twrp cmd cannot decrypt a password with space, should decrypt on gui
+		if (parts.size() == 1) {
+			gui_err("no_pwd=No password provided.");
+		} else {
+			string pass = parts[1];
+			string userid = "0";
+			if (parts.size() > 2)
+				userid = parts[2];
+
+			gui_msg("decrypt_cmd=Attempting to decrypt data partition or user data via command line.");
+			if (PartitionManager.Decrypt_Device(pass, atoi(userid.c_str())) == 0) {
+				// set_page_done = 1;  // done by singleaction_page anyway
+				std::string orsFile = TWFunc::get_log_dir() + "/openrecoveryscript";
+				if (TWFunc::Path_Exists(orsFile)) {
+					Run_OpenRecoveryScript_Action();
+				}
 			}
 		}
 	} else if (OpenRecoveryScript::Insert_ORS_Command(command)) {
